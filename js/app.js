@@ -4,6 +4,58 @@
   var D = window.GG_DATA;
   var app = document.getElementById("app");
 
+  // ---------- 데이터: 공공데이터 수집 결과(data/*.json) → 없으면 샘플 ----------
+  var DS = { programs: [], hospitals: [], toilets: [], meta: null, real: {}, centers: {} };
+
+  function sampleData() {
+    DS.programs = D.programs.map(function (p) {
+      return { id: p.id, name: p.name, summary: p.summary, target: p.target, support: p.support,
+        how: p.how.join(" → "), period: p.period, org: "샘플", receipt: "", field: p.fields.join(","),
+        userType: "", url: p.source.url, srcName: p.source.name, docs: p.docs, local: false, sample: true };
+    });
+    DS.hospitals = D.places.filter(function (x) { return x.type === "hospital"; })
+      .map(function (x) { return { name: x.name, addr: "", kind: x.dept, lat: x.lat, lng: x.lng, hours: x.hours, sample: true }; });
+    DS.toilets = D.places.filter(function (x) { return x.type === "toilet"; })
+      .map(function (x) { return { name: x.name, addr: "", hours: x.hours, accessible: x.accessible, lat: x.lat, lng: x.lng, sample: true }; });
+  }
+
+  function getJSON(path) {
+    return fetch(path, { cache: "no-cache" }).then(function (r) { if (!r.ok) throw new Error(r.status); return r.json(); });
+  }
+
+  function loadData() {
+    sampleData();
+    DS.centers = Object.assign({}, D.cityCenters);
+    return Promise.all([
+      getJSON("data/meta.json").catch(function () { return null; }),
+      getJSON("data/programs.json").catch(function () { return null; }),
+      getJSON("data/hospitals.json").catch(function () { return null; }),
+      getJSON("data/toilets.json").catch(function () { return null; })
+    ]).then(function (r) {
+      DS.meta = r[0];
+      if (r[1] && r[1].length) { DS.programs = r[1]; DS.real.programs = true; }
+      if (r[2] && r[2].length) { DS.hospitals = r[2]; DS.real.hospitals = true; }
+      if (r[3] && r[3].length) { DS.toilets = r[3]; DS.real.toilets = true; }
+      if (DS.real.programs || DS.real.hospitals || DS.real.toilets) {
+        var ft = document.querySelector(".foot");
+        if (ft) ft.textContent = "공공데이터포털 자료 기반 (수집일 " + collected() + ") — 정확한 내용은 공식 출처에서 확인하세요." +
+          (DS.real.programs && DS.real.hospitals && DS.real.toilets ? "" : " 일부 항목은 아직 샘플이에요.");
+      }
+      // 병원 주소로 18개 시·군 기준점 계산 (위치 권한이 없을 때 사용)
+      if (DS.real.hospitals) {
+        D.regions.forEach(function (reg) {
+          var short = reg.replace(/[시군]$/, "");
+          var hs = DS.hospitals.filter(function (h) { return h.addr && h.addr.indexOf(short) >= 0; });
+          if (hs.length) {
+            DS.centers[reg] = [hs.reduce(function (a, h) { return a + h.lat; }, 0) / hs.length,
+              hs.reduce(function (a, h) { return a + h.lng; }, 0) / hs.length];
+          }
+        });
+      }
+    });
+  }
+  function collected() { return DS.meta && DS.meta.collectedAt ? DS.meta.collectedAt.slice(0, 10) : D.collectedAt; }
+
   // ---------- 저장소 (기기 안에만 저장) ----------
   function load(key, fallback) {
     try { var v = localStorage.getItem("gg." + key); return v ? JSON.parse(v) : fallback; }
@@ -42,6 +94,14 @@
   }
   function distText(m) { return m < 1000 ? Math.round(m / 10) * 10 + "m" : (m / 1000).toFixed(1) + "km"; }
   function openState(hours) {
+    if (hours && typeof hours === "object") {
+      var dow = new Date().getDay(); var key = String(dow === 0 ? 7 : dow);
+      var hv = hours[key];
+      if (!Object.keys(hours).length) return { open: null, text: "진료시간 확인 필요" };
+      if (!hv) return { open: false, text: "오늘 휴진" };
+      var fmt = function (x) { x = String(x).padStart(4, "0"); return x.slice(0, 2) + ":" + x.slice(2); };
+      hours = fmt(hv[0]) + "~" + fmt(hv[1]);
+    }
     if (!hours) return { open: null, text: "운영시간 확인 필요" };
     if (hours.indexOf("24시간") === 0) return { open: true, text: "지금 열림 · 24시간" };
     var m = hours.match(/(\d{2}):(\d{2})~(\d{2}):(\d{2})/);
@@ -167,7 +227,32 @@
 
   // ---------- 화면: AI 상담 (시제품: 샘플 자료 검색) ----------
   var chatLog = [];
-  function findProgram(id) { return D.programs.filter(function (p) { return p.id === id; })[0]; }
+  function findProgram(id) { return DS.programs.filter(function (p) { return String(p.id) === String(id); })[0]; }
+
+  var STOP = /(이|가|은|는|을|를|에|에서|의|도|로|으로|요|나요|있어|있나요|있어요|알려줘|알려주세요|받을|수|있는|좀|뭐|어떤|하는|해줘)$/;
+  function tokens(q) {
+    return q.replace(/[?!.,~]/g, " ").split(/\s+/).map(function (w) {
+      for (var i = 0; i < 2; i++) w = w.replace(STOP, "");
+      return w;
+    }).filter(function (w) { return w.length >= 2 && !/^(지원|혜택|정보|사업|서비스)$/.test(w); });
+  }
+  var SYN = { "어르신": "노인|어르신|65세|고령", "노인": "노인|어르신|65세|고령", "할머니": "노인|어르신", "할아버지": "노인|어르신",
+    "난방비": "난방|에너지|연료", "난방": "난방|에너지|연료", "병원비": "의료비|진료비|의료", "월세": "월세|임차|주거",
+    "청년": "청년", "아기": "출산|영아|아동", "출산": "출산|임신", "일자리": "일자리|취업|고용", "돌봄": "돌봄|요양|보호" };
+  function regionOf(t) { return D.regions.filter(function (r) { return t.indexOf(r.replace(/[시군]$/, "")) >= 0; })[0]; }
+  function searchPrograms(q, region) {
+    var ws = tokens(q).filter(function (w) { return !region || w.indexOf(region.replace(/[시군]$/, "")) < 0; });
+    if (!ws.length) return [];
+    var res = ws.map(function (w) { return new RegExp(SYN[w] || w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")); });
+    var short = region ? region.replace(/[시군]$/, "") : null;
+    return DS.programs.map(function (p) {
+      var hay = p.name + " " + p.summary + " " + p.target + " " + p.field;
+      var s = 0; res.forEach(function (re) { if (re.test(p.name)) s += 3; else if (re.test(hay)) s += 1; });
+      if (s && p.local) s += (short && p.org.indexOf(short) >= 0) ? 3 : -1;
+      if (s && short && p.local && p.org.indexOf(short) < 0 && p.org.indexOf("강원특별자치도") !== 0) s = 0;
+      return { p: p, s: s };
+    }).filter(function (x) { return x.s > 0; }).sort(function (a, b) { return b.s - a.s; });
+  }
 
   function answer(q) {
     var t = q.replace(/\s+/g, "");
@@ -177,11 +262,8 @@
     if (/병원|의원|아파|아픈|약국|진료|응급/.test(t)) {
       return { text: "가까운 병원을 찾아드릴게요.", actions: [{ label: "병원 찾기", href: "#/places/hospital" }] };
     }
-    var region = D.regions.filter(function (r) { return t.indexOf(r.replace(/[시군]$/, "")) >= 0; })[0];
-    var scored = D.programs.map(function (p) {
-      var s = 0; p.keywords.forEach(function (k) { if (t.indexOf(k) >= 0) s += 1; });
-      return { p: p, s: s };
-    }).filter(function (x) { return x.s > 0; }).sort(function (a, b) { return b.s - a.s; }).slice(0, 3);
+    var region = regionOf(t) || (load("profile", {}).region || null);
+    var scored = searchPrograms(q, region).slice(0, 3);
     if (!scored.length) {
       return { text: "확인된 자료가 없어요. 이런 걸 물어보시겠어요?", chips: D.suggestions };
     }
@@ -190,13 +272,14 @@
     return {
       text: head + "\n" + lines.join("\n"),
       actions: scored.map(function (x) { return { label: x.p.name + " 자세히", href: "#/support/" + x.p.id }; }),
-      sources: scored.map(function (x) { return x.p.source; }).filter(function (s, i, a) { return a.findIndex(function (y) { return y.url === s.url; }) === i; })
+      sources: scored.map(function (x) { return { name: x.p.srcName || "정부24", url: x.p.url || "https://www.gov.kr" }; })
+        .filter(function (s, i, a) { return a.findIndex(function (y) { return y.name === s.name; }) === i; })
     };
   }
 
   function viewChat(query) {
     var h = '<a class="back" href="#/">← 처음으로</a><h1>물어보기</h1>';
-    h += '<p class="notice">시제품입니다. AI 모델을 연결하기 전이라 샘플 자료에서 찾아 답해요.</p>';
+    h += '<p class="notice">' + (DS.real.programs ? '공공서비스(혜택) 정보에서 찾아 답해요. AI 답변 기능은 준비 중이에요.' : '시제품입니다. 샘플 자료에서 찾아 답해요.') + '</p>';
     h += '<div class="chat" id="chat"></div>';
     h += '<div id="chips"></div>';
     h += '<form class="composer" id="form"><input id="q" placeholder="궁금한 것을 써 주세요" aria-label="질문 입력" autocomplete="off">' +
@@ -235,7 +318,7 @@
       if (m.sources) {
         a += '<div class="src">출처: ' + m.sources.map(function (s) {
           return '<a href="' + esc(s.url) + '" target="_blank" rel="noopener">' + esc(s.name) + '</a>';
-        }).join(", ") + ' · 수집일 ' + esc(D.collectedAt) + ' (샘플)</div>';
+        }).join(", ") + ' · 수집일 ' + esc(collected()) + (DS.real.programs ? '' : ' (샘플)') + '</div>';
       }
       a += '<div class="actions"><button class="chip" data-speak="' + i + '">읽어주기</button>';
       (m.actions || []).forEach(function (x) { a += '<a class="chip" href="' + esc(x.href) + '">' + esc(x.label) + '</a>'; });
@@ -275,21 +358,38 @@
       };
       return;
     }
-    var list = D.programs.filter(function (p) {
-      return (!prof.age || p.ages.indexOf(prof.age) >= 0) && (!prof.field || p.fields.indexOf(prof.field) >= 0);
+    var AGE = { "65+": /노인|어르신|65세|고령|기초연금/, "50-64": /중장년|50세|55세|60세|신중년/, "35-49": /성인|부모|가구|자녀/, "19-34": /청년|19세|34세|39세|대학/ };
+    var FIELD = { "생활비": /생활|생계|연금|수당|요금|난방|에너지|바우처/, "돌봄": /돌봄|요양|보호|간병/, "일자리": /일자리|취업|고용|창업|근로/,
+      "건강": /건강|의료|검진|치료|진료/, "주거": /주거|주택|월세|전세|임대/ };
+    var short = prof.region ? prof.region.replace(/[시군]$/, "") : null;
+    var list = DS.programs.filter(function (p) {
+      var hay = p.name + " " + p.summary + " " + p.target + " " + p.field;
+      if (prof.age && !AGE[prof.age].test(hay)) return false;
+      if (prof.field && !FIELD[prof.field].test(hay)) return false;
+      if (p.local && short && p.org.indexOf(short) < 0 && p.org.indexOf("강원특별자치도") !== 0) return false;
+      return true;
+    }).sort(function (a, b) {
+      var la = a.local && short && a.org.indexOf(short) >= 0 ? 0 : a.local ? 1 : 2;
+      var lb = b.local && short && b.org.indexOf(short) >= 0 ? 0 : b.local ? 1 : 2;
+      return la - lb;
     });
+    var shownN = +(sessionStorage.getItem("gg.more") || 20);
     var h2 = '<a class="back" href="#/">← 처음으로</a><h1>나에게 맞는 지원</h1>';
     h2 += '<p class="label">' + esc([prof.region, ageLabel(prof.age), prof.field].filter(Boolean).join(" · ") || "조건 없음") + '</p>';
-    h2 += '<p class="notice">샘플 요약입니다. 받을 수 있는지는 공식 출처에서 꼭 확인하세요.</p>';
+    h2 += '<p class="notice">' + (DS.real.programs ? '공공서비스(혜택) 정보 기준 · 수집일 ' + esc(collected()) + '. 받을 수 있는지는 공식 기준에서 확인하세요.' : '샘플 요약입니다. 받을 수 있는지는 공식 출처에서 꼭 확인하세요.') + '</p>';
+    h2 += '<p class="label">' + list.length + '개 찾았어요' + (short ? ' · ' + esc(prof.region) + ' 사업을 먼저 보여드려요' : '') + '</p>';
     if (!list.length) {
       h2 += '<p>조건에 맞는 지원을 찾지 못했어요.</p>';
     }
-    list.forEach(function (p) {
-      h2 += '<a class="card" style="display:block;color:inherit;text-decoration:none" href="#/support/' + esc(p.id) + '"><h3>' + esc(p.name) + '</h3><p>' + esc(p.summary) + '</p><p class="meta">신청: ' + esc(p.period) + '</p></a>';
+    list.slice(0, shownN).forEach(function (p) {
+      h2 += '<a class="card" style="display:block;color:inherit;text-decoration:none" href="#/support/' + encodeURIComponent(p.id) + '"><h3>' + esc(p.name) + '</h3><p>' + esc(p.summary) + '</p><p class="meta">' + esc(p.org) + (p.period ? ' · 신청: ' + esc(p.period) : '') + '</p></a>';
     });
+    if (list.length > shownN) h2 += '<button class="btn" id="morep">더 보기</button>';
     h2 += '<button class="btn" id="reset">조건 다시 고르기</button>';
     app.innerHTML = h2;
-    document.getElementById("reset").onclick = function () { save("profile", {}); viewSupport(); };
+    var mp = document.getElementById("morep");
+    if (mp) mp.onclick = function () { sessionStorage.setItem("gg.more", shownN + 20); viewSupport(); };
+    document.getElementById("reset").onclick = function () { save("profile", {}); sessionStorage.removeItem("gg.more"); viewSupport(); };
   }
   function ageLabel(a) { var o = STEPS[1].options.filter(function (x) { return x[0] === a; })[0]; return o ? o[1] : ""; }
 
@@ -301,16 +401,20 @@
     var h = '<a class="back" href="#/support">← 목록으로</a><h1>' + esc(p.name) + '</h1>';
     h += '<p>' + esc(p.summary) + '</p>';
     h += '<button class="btn" id="read">읽어주기</button>';
-    h += '<h2>누가 받을 수 있나요</h2><p>' + esc(p.target) + '</p>';
-    h += '<h2>무엇을 받나요</h2><p>' + esc(p.support) + '</p>';
-    h += '<h2>언제 신청하나요</h2><p>' + esc(p.period) + '</p>';
-    h += '<h2>준비할 서류</h2><ul class="checklist">' + p.docs.map(function (d) { return '<li>' + esc(d) + '</li>'; }).join("") + '</ul>';
-    h += '<h2>신청 방법</h2><ol class="steps">' + p.how.map(function (d) { return '<li>' + esc(d) + '</li>'; }).join("") + '</ol>';
-    h += '<p class="meta">출처: <a href="' + esc(p.source.url) + '" target="_blank" rel="noopener">' + esc(p.source.name) + '</a> · 수집일 ' + esc(D.collectedAt) + ' (샘플 요약)</p>';
+    if (p.target) h += '<h2>누가 받을 수 있나요</h2><p>' + esc(p.target) + '</p>';
+    if (p.support) h += '<h2>무엇을 받나요</h2><p>' + esc(p.support) + '</p>';
+    if (p.period) h += '<h2>언제 신청하나요</h2><p>' + esc(p.period) + '</p>';
+    if (p.docs) h += '<h2>준비할 서류</h2><ul class="checklist">' + p.docs.map(function (d) { return '<li>' + esc(d) + '</li>'; }).join("") + '</ul>';
+    if (p.how) h += '<h2>신청 방법</h2><p>' + esc(p.how) + '</p>';
+    if (p.receipt) h += '<p class="meta">접수: ' + esc(p.receipt) + '</p>';
+    h += '<p class="meta">담당: ' + esc(p.org) + (p.dept ? ' ' + esc(p.dept) : '') + '</p>';
+    var srcName = p.srcName || "정부24";
+    h += '<a class="btn" target="_blank" rel="noopener" href="' + esc(p.url || "https://www.gov.kr") + '">' + esc(srcName) + '에서 자세히 보기<small>준비 서류·최신 기준 확인</small></a>';
+    h += '<p class="meta">출처: ' + esc(DS.real.programs ? "행정안전부 공공서비스(혜택) 정보" : srcName) + ' · 수집일 ' + esc(collected()) + (p.sample ? ' (샘플 요약)' : '') + '</p>';
     h += '<button class="btn primary" id="send">가족에게 보내기</button>';
     app.innerHTML = h;
     document.getElementById("read").onclick = function () {
-      speak(p.name + ". " + p.summary + " 대상은 " + p.target + ". 신청 방법은 " + p.how.join(", ") + ".");
+      speak([p.name, p.summary, p.target ? "대상은 " + p.target : "", p.how ? "신청 방법은 " + p.how : ""].filter(Boolean).join(". "));
     };
     document.getElementById("send").onclick = function () {
       var from = (fam && fam.myLabel) || "가족";
@@ -327,52 +431,79 @@
     var h = '<a class="back" href="#/">← 처음으로</a><h1>' + title + '</h1>';
     h += '<div class="tabs"><a href="#/places/hospital" class="' + (type === "hospital" ? "on" : "") + '">병원</a>' +
       '<a href="#/places/toilet" class="' + (type === "toilet" ? "on" : "") + '">화장실</a></div>';
-    h += '<p class="notice">시제품: 춘천·원주·강릉의 샘플 위치예요. 실제 서비스는 공공데이터로 바뀌어요.</p>';
+    var real = type === "toilet" ? DS.real.toilets : DS.real.hospitals;
+    h += '<p class="notice">' + (real ? (type === "toilet" ? "행정안전부 공중화장실정보" : "공공 병·의원 정보") + ' · 수집일 ' + esc(collected()) + '. 운영시간은 바뀔 수 있어요.' : '시제품: 춘천·원주·강릉의 샘플 위치예요.') + '</p>';
     h += '<div id="map" class="map"></div><div id="list"><p>위치를 확인하고 있어요…</p></div>';
     h += '<div id="morebox"></div>';
     app.innerHTML = h;
     var fallbackCity = load("city", "춘천시");
+    if (!DS.centers[fallbackCity]) fallbackCity = "춘천시";
 
     getPosition(function (pos) {
       var me = pos, usedCity = null;
-      if (!me) { usedCity = fallbackCity; me = D.cityCenters[usedCity]; }
+      if (!me) { usedCity = fallbackCity; me = DS.centers[usedCity]; }
       else {
         // 강원 밖이면 샘플이 너무 멀어서 시·군 기준점을 대신 사용
-        var nearest = Math.min.apply(null, Object.keys(D.cityCenters).map(function (c) { return distM(pos, D.cityCenters[c]); }));
-        if (nearest > 60000) { usedCity = fallbackCity; me = D.cityCenters[usedCity]; }
+        var nearest = Math.min.apply(null, Object.keys(DS.centers).map(function (c) { return distM(pos, DS.centers[c]); }));
+        if (nearest > 60000) { usedCity = fallbackCity; me = DS.centers[usedCity]; }
       }
       addRecent((type === "toilet" ? "화장실" : "병원") + " 찾기");
       renderPlaces(type, me, usedCity, 3);
     });
   }
 
+  // 내 위치에서 가장 가까운 병원 주소로 시·군을 추정 (좌표 없는 화장실 보완용)
+  function guessRegion(me) {
+    var best = null, bd = 1e12;
+    DS.hospitals.forEach(function (h) { if (h.addr) { var d = distM(me, [h.lat, h.lng]); if (d < bd) { bd = d; best = h; } } });
+    if (!best || bd > 15000) return null;
+    return D.regions.filter(function (r) { return best.addr.indexOf(r) >= 0; })[0] || null;
+  }
+
   function renderPlaces(type, me, usedCity, count) {
-    var items = D.places.filter(function (p) { return p.type === type; })
+    var src = type === "toilet" ? DS.toilets : DS.hospitals;
+    var withXY = src.filter(function (p) { return p.lat && p.lng; })
       .map(function (p) { return Object.assign({ d: distM(me, [p.lat, p.lng]) }, p); })
       .sort(function (a, b) { return a.d - b.d; });
+    var items = withXY;
+    // 좌표가 없는 화장실은 같은 시·군 것을 거리 없이 뒤에 붙임
+    if (type === "toilet") {
+      var reg = usedCity || guessRegion(me);
+      var near = withXY.filter(function (p) { return p.d < 5000; }).length;
+      if (reg && near < count) {
+        var extra = src.filter(function (p) { return !(p.lat && p.lng) && p.addr && p.addr.indexOf(reg) >= 0; })
+          .map(function (p) { return Object.assign({ d: null }, p); });
+        items = withXY.filter(function (p) { return p.d < 5000; }).concat(extra, withXY.filter(function (p) { return p.d >= 5000; }));
+      }
+    }
     var shown = items.slice(0, count);
     var list = document.getElementById("list"); if (!list) return;
     var h = '';
     if (usedCity) {
       h += '<label class="field">기준 지역 (위치를 쓸 수 없을 때)<select id="city">' +
-        Object.keys(D.cityCenters).map(function (c) { return '<option' + (c === usedCity ? ' selected' : '') + '>' + c + '</option>'; }).join("") +
+        Object.keys(DS.centers).map(function (c) { return '<option' + (c === usedCity ? ' selected' : '') + '>' + c + '</option>'; }).join("") +
         '</select></label>';
     }
+    if (!shown.length) h += '<p>찾은 곳이 없어요.</p>';
     h += shown.map(function (p, i) {
       var st = openState(p.hours);
       var badge = st.open === true ? '<span class="badge open">열림</span>' : st.open === null ? '<span class="badge check">확인 필요</span>' : '<span class="badge check">닫힘</span>';
-      var extra = type === "toilet" ? (p.accessible ? " · 장애인용 있음" : "") : (p.dept ? " · " + p.dept : "");
-      return '<div class="place"><h3>' + (i + 1) + '. ' + esc(p.name) + badge + '</h3><p class="meta">' + distText(p.d) + ' · ' + esc(st.text) + esc(extra) + '</p>' +
-        '<a class="chip" target="_blank" rel="noopener" href="https://map.kakao.com/link/to/' + encodeURIComponent(p.name) + ',' + p.lat + ',' + p.lng + '">길찾기</a></div>';
+      var extra = type === "toilet" ? (p.accessible ? " · 장애인용 있음" : "") : (p.kind ? " · " + p.kind : "") + (p.er ? " · 응급실" : "");
+      var dist = p.d == null ? "거리 확인 중" : distText(p.d);
+      var link = p.lat ? 'https://map.kakao.com/link/to/' + encodeURIComponent(p.name) + ',' + p.lat + ',' + p.lng
+        : 'https://map.kakao.com/?q=' + encodeURIComponent(p.addr || p.name);
+      return '<div class="place"><h3>' + (i + 1) + '. ' + esc(p.name) + badge + '</h3><p class="meta">' + dist + ' · ' + esc(st.text) + esc(extra) + '</p>' +
+        (p.addr ? '<p class="meta">' + esc(p.addr) + '</p>' : '') +
+        '<a class="chip" target="_blank" rel="noopener" href="' + link + '">' + (p.lat ? '길찾기' : '지도에서 보기') + '</a></div>';
     }).join("");
     list.innerHTML = h;
     var sel = document.getElementById("city");
-    if (sel) sel.onchange = function () { save("city", sel.value); renderPlaces(type, D.cityCenters[sel.value], sel.value, count); };
+    if (sel) sel.onchange = function () { save("city", sel.value); renderPlaces(type, DS.centers[sel.value], sel.value, count); };
     var more = document.getElementById("morebox");
     more.innerHTML = count < items.length ? '<button class="btn" id="more">더 보기</button>' : '';
     var mb = document.getElementById("more");
     if (mb) mb.onclick = function () { renderPlaces(type, me, usedCity, count + 3); };
-    drawMap(me, shown, !usedCity);
+    drawMap(me, shown.filter(function (p) { return p.lat; }), !usedCity);
   }
 
   function drawMap(me, shown, isReal) {
@@ -536,5 +667,6 @@
   applySize(load("size", "1"));
 
   window.addEventListener("hashchange", route);
-  route();
+  app.innerHTML = '<p>불러오는 중…</p>';
+  loadData().then(route, route);
 })();
